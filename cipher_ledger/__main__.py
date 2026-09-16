@@ -13,9 +13,10 @@ def main() -> None:
     args = parser.parse_args()
     try:
         config = load_config(args.db, args.keyring)
+        server = LedgerServer((args.host, args.port), config)
     except ValueError:
         parser.error("Invalid keyring configuration")
-    with LedgerServer((args.host, args.port), config) as server:
+    with server:
         print(f"Cipher Ledger listening on {args.host}:{server.server_port}", flush=True)
         try:
             server.serve_forever()

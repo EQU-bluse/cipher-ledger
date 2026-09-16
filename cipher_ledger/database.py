@@ -1,18 +1,25 @@
-"""SQLite connection and service metadata foundation."""
+"""SQLite connection, schema and service metadata foundation."""
 
 import sqlite3
 from pathlib import Path
 
 
 def connect(database: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(database), timeout=15)
+    connection = sqlite3.connect(str(database), timeout=15, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=15000")
     return connection
 
 
-def initialize(database: str | Path) -> None:
+def initialize(database: str | Path, initial_version: int | None = None) -> None:
+    """Create base schema.
+
+    When ``initial_version`` is given (service startup with record support
+    enabled) it also creates the public ``records`` table and seeds the
+    persisted active key version the first time records are enabled. On later
+    restarts the database value wins and the config seed is ignored.
+    """
     Path(database).parent.mkdir(parents=True, exist_ok=True)
     connection = connect(database)
     try:
@@ -26,5 +33,21 @@ def initialize(database: str | Path) -> None:
                 "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
                 ("service_name", "cipher-ledger"),
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS records ("
+                "tenant TEXT NOT NULL, "
+                "id TEXT NOT NULL, "
+                "key_version INTEGER NOT NULL, "
+                "nonce BLOB NOT NULL, "
+                "ciphertext BLOB NOT NULL, "
+                "wrap_nonce BLOB NOT NULL, "
+                "wrapped_key BLOB NOT NULL, "
+                "PRIMARY KEY (tenant, id))"
+            )
+            if initial_version is not None:
+                connection.execute(
+                    "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
+                    ("active_version", str(initial_version)),
+                )
     finally:
         connection.close()
