@@ -72,6 +72,9 @@ class RecordProtocolTests(unittest.TestCase):
     def read(self, record_id, tenant="acme"):
         return self.request("GET", f"/v1/records/{record_id}", tenant=tenant)
 
+    def list(self, tenant="acme"):
+        return self.request("GET", "/v1/records", tenant=tenant)
+
     # -- basic round trips -------------------------------------------------
 
     def test_create_and_read_round_trip(self):
@@ -244,6 +247,157 @@ class RecordProtocolTests(unittest.TestCase):
         self.assertEqual(self.request("POST", "/v1/keys/rotate", {"version": 2}), (200, {"active_version": 2, "rewrapped": 3}))
         for i in range(3):
             self.assertEqual(self.read(f"rec{i}")[1]["plaintext"], f"payload {i}")
+
+    def test_insert_trigger_abort_is_storage_error_without_side_effects(self):
+        self.assertEqual(self.create("before", "kept")[0], 201)
+        raw = connect(self.directory / "ledger.sqlite3")
+        with raw:
+            raw.execute("CREATE TRIGGER block_records_insert BEFORE INSERT ON records "
+                        "BEGIN SELECT RAISE(ABORT, 'inserts disabled'); END")
+        raw.close()
+
+        # A trigger abort is a storage failure, never a 409 conflict.
+        self.assertEqual(self.create("blocked", "should not persist"), (503, {"error": "storage_error"}))
+
+        raw = connect(self.directory / "ledger.sqlite3")
+        count = raw.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        rows = {r[0] for r in raw.execute("SELECT id FROM records")}
+        raw.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(rows, {"before"})
+        # Existing data and reads keep working despite the failed write.
+        self.assertEqual(self.read("before")[1]["plaintext"], "kept")
+
+        # After the fault clears, creates work again and true duplicates still
+        # map to 409 conflict.
+        raw = connect(self.directory / "ledger.sqlite3")
+        with raw:
+            raw.execute("DROP TRIGGER block_records_insert")
+        raw.close()
+        self.assertEqual(self.create("after", "new")[0], 201)
+        self.assertEqual(self.create("before", "overwrite?"), (409, {"error": "conflict"}))
+        self.assertEqual(self.read("before")[1]["plaintext"], "kept")
+
+    # -- inventory (GET /v1/records) ---------------------------------------
+
+    def test_inventory_empty_tenant(self):
+        self.assertEqual(self.list(), (200, {"tenant": "acme", "active_version": 1, "records": []}))
+
+    def test_inventory_lists_only_id_and_version_sorted_ascii(self):
+        # Creation order deliberately differs from ASCII order.
+        for record_id in ("zebra", "Apple", "banana", "_under", "1num", "a", "aa"):
+            self.assertEqual(self.create(record_id, "p")[0], 201)
+        status, body = self.list()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tenant"], "acme")
+        self.assertEqual(body["active_version"], 1)
+        ids = [entry["id"] for entry in body["records"]]
+        # ASCII: digits < uppercase < underscore < lowercase.
+        self.assertEqual(ids, ["1num", "Apple", "_under", "a", "aa", "banana", "zebra"])
+        self.assertEqual(
+            body["records"][0], {"id": "1num", "key_version": 1}
+        )
+        for entry in body["records"]:
+            self.assertEqual(set(entry), {"id", "key_version"})
+        # No envelope material or other sensitive fields anywhere.
+        encoded = json.dumps(body)
+        for forbidden in ("nonce", "ciphertext", "wrapped", "plaintext"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_inventory_scoped_to_tenant(self):
+        self.create("shared", "a", tenant="alpha")
+        self.create("alpha_only", "a", tenant="alpha")
+        self.create("shared", "b", tenant="beta")
+        status, body = self.request("GET", "/v1/records", tenant="alpha")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tenant"], "alpha")
+        self.assertEqual(
+            body["records"],
+            [{"id": "alpha_only", "key_version": 1}, {"id": "shared", "key_version": 1}],
+        )
+        status, body = self.request("GET", "/v1/records", tenant="beta")
+        self.assertEqual(body["records"], [{"id": "shared", "key_version": 1}])
+
+    def test_inventory_reports_active_version_after_rotation(self):
+        self.create("r1", "p")
+        self.create("r2", "p")
+        self.request("POST", "/v1/keys/rotate", {"version": 2})
+        self.assertEqual(
+            self.list(),
+            (
+                200,
+                {
+                    "tenant": "acme",
+                    "active_version": 2,
+                    "records": [
+                        {"id": "r1", "key_version": 2},
+                        {"id": "r2", "key_version": 2},
+                    ],
+                },
+            ),
+        )
+        # A record created afterwards is listed at the new version.
+        self.create("r3", "p")
+        _, body = self.list()
+        self.assertEqual(body["active_version"], 2)
+        self.assertEqual(body["records"][-1], {"id": "r3", "key_version": 2})
+
+    def test_inventory_requires_tenant_header(self):
+        self.assertEqual(self.request("GET", "/v1/records"), (400, {"error": "invalid_request"}))
+        self.assertEqual(
+            self.request("GET", "/v1/records", tenant="bad tenant!"),
+            (400, {"error": "invalid_request"}),
+        )
+
+    def test_inventory_damaged_envelope_is_integrity_error_without_partial_list(self):
+        self.create("aaa", "fine")
+        self.create("zzz", "fine")
+        raw = connect(self.directory / "ledger.sqlite3")
+        blob = bytearray(raw.execute("SELECT ciphertext FROM records WHERE id='zzz'").fetchone()[0])
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='zzz'", (bytes(blob),))
+        raw.close()
+        self.assertEqual(self.list(), (422, {"error": "integrity_error"}))
+
+    def test_inventory_damage_in_other_tenant_does_not_block(self):
+        self.create("doc", "alpha data", tenant="alpha")
+        self.create("doc", "beta data", tenant="beta")
+        raw = connect(self.directory / "ledger.sqlite3")
+        blob = bytearray(
+            raw.execute("SELECT wrapped_key FROM records WHERE tenant='beta'").fetchone()[0]
+        )
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute(
+                "UPDATE records SET wrapped_key=? WHERE tenant='beta'", (bytes(blob),)
+            )
+        raw.close()
+        # Beta's own inventory fails; alpha's inventory is unaffected.
+        self.assertEqual(self.list(tenant="beta"), (422, {"error": "integrity_error"}))
+        self.assertEqual(
+            self.list(tenant="alpha"),
+            (200, {"tenant": "alpha", "active_version": 1,
+                   "records": [{"id": "doc", "key_version": 1}]}),
+        )
+
+    def test_inventory_remains_available_after_integrity_failure(self):
+        self.create("aaa", "fine")
+        self.create("zzz", "fine")
+        raw = connect(self.directory / "ledger.sqlite3")
+        blob = bytearray(raw.execute("SELECT ciphertext FROM records WHERE id='aaa'").fetchone()[0])
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='aaa'", (bytes(blob),))
+        raw.close()
+        self.assertEqual(self.list(), (422, {"error": "integrity_error"}))
+        # The service still answers healthy requests and other tenants.
+        self.assertEqual(self.request("GET", "/health")[0], 200)
+        self.assertEqual(
+            self.list(tenant="other"),
+            (200, {"tenant": "other", "active_version": 1, "records": []}),
+        )
+        self.assertEqual(self.create("new", "p", tenant="other")[0], 201)
 
     # -- tamper protection -------------------------------------------------
 
@@ -427,6 +581,63 @@ class RecordProtocolTests(unittest.TestCase):
         self.assertEqual(count, 10)
         for record_id in [f"old{i}" for i in range(5)] + [f"new{i}" for i in range(5)]:
             self.assertEqual(self.read(record_id)[0], 200)
+
+    def test_inventory_concurrent_with_create_and_rotation_is_always_a_snapshot(self):
+        for i in range(5):
+            self.create(f"old{i}", f"old {i}")
+        stop = threading.Event()
+        failures = []
+        snapshots = []
+
+        def make_new(index):
+            status, _ = self.create(f"new{index}", f"new {index}")
+            if status != 201:
+                failures.append(("create", status))
+
+        def rotate():
+            status, body = self.request("POST", "/v1/keys/rotate", {"version": 2})
+            if status != 200:
+                failures.append(("rotate", status, body))
+
+        def list_again():
+            while not stop.is_set():
+                status, body = self.list()
+                if status != 200:
+                    failures.append(("list", status, body))
+                    continue
+                active = body["active_version"]
+                if active not in (1, 2):
+                    failures.append(("active", active))
+                versions = {entry["key_version"] for entry in body["records"]}
+                # No half-rotated snapshot: every listed entry must match the
+                # active version reported in the same response.
+                if versions != {active}:
+                    failures.append(("mixed", active, versions))
+                ids = [entry["id"] for entry in body["records"]]
+                if ids != sorted(ids):
+                    failures.append(("order", ids))
+                snapshots.append(body)
+
+        listers = [threading.Thread(target=list_again) for _ in range(4)]
+        for thread in listers:
+            thread.start()
+        creators = [threading.Thread(target=make_new, args=(i,)) for i in range(5)]
+        rotator = threading.Thread(target=rotate)
+        for thread in creators + [rotator]:
+            thread.start()
+        for thread in creators + [rotator]:
+            thread.join()
+        stop.set()
+        for thread in listers:
+            thread.join()
+
+        self.assertEqual(failures, [])
+        self.assertTrue(snapshots)  # listers observed at least one snapshot
+        status, body = self.list()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["active_version"], 2)
+        self.assertEqual({e["key_version"] for e in body["records"]}, {2})
+        self.assertEqual(len(body["records"]), 10)
 
     # -- helpers -----------------------------------------------------------
 

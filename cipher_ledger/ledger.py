@@ -40,6 +40,24 @@ def storage() -> LedgerError:
     return LedgerError(503, "storage_error")
 
 
+# Only the composite (tenant, id) primary-key collision is a client conflict.
+# Every other write failure -- including a BEFORE INSERT trigger aborting with
+# RAISE(ABORT), which also surfaces as sqlite3.IntegrityError but carries the
+# SQLITE_CONSTRAINT_TRIGGER extended code -- is a transient storage failure.
+_UNIQUE_CONFLICT_CODES = frozenset(
+    code
+    for code in (
+        getattr(sqlite3, "SQLITE_CONSTRAINT_PRIMARYKEY", None),
+        getattr(sqlite3, "SQLITE_CONSTRAINT_UNIQUE", None),
+    )
+    if code is not None
+)
+
+
+def _is_unique_conflict(exc: sqlite3.Error) -> bool:
+    return getattr(exc, "sqlite_errorcode", None) in _UNIQUE_CONFLICT_CODES
+
+
 class Ledger:
     def __init__(self, config: Config):
         initialize(config.database, config.active_version)
@@ -89,10 +107,12 @@ class Ledger:
                             sealed["wrapped_key"],
                         ),
                     )
-            except sqlite3.IntegrityError:
-                # PRIMARY KEY (tenant, id) violation -> record already exists.
-                raise conflict() from None
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                # A trigger RAISE(ABORT) is also an IntegrityError, so the
+                # exception type alone cannot distinguish a duplicate id. Only a
+                # composite (tenant, id) uniqueness violation is a 409.
+                if _is_unique_conflict(exc):
+                    raise conflict() from None
                 raise storage() from None
             return version
 
@@ -113,6 +133,39 @@ class Ledger:
             except envelope.EnvelopeIntegrityError:
                 raise integrity() from None
             return {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
+
+    def inventory(self, tenant: str) -> dict:
+        """Return the tenant's key-usage inventory.
+
+        Every one of the tenant's envelopes is fully authenticated before
+        anything is returned, so the response is either the complete list or
+        integrity_error -- never a partial list. Only this tenant's rows are
+        read, so damage in another tenant cannot block the query. The whole
+        check runs under the same lock as create/rotate, so the active version
+        and every entry correspond to one complete serial point in time.
+        """
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    "SELECT id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key "
+                    "FROM records WHERE tenant=? ORDER BY id ASC",
+                    (tenant,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            entries = []
+            for row in rows:
+                record_id = row["id"]
+                try:
+                    envelope.open_envelope(self._keys, tenant, record_id, row)
+                except envelope.EnvelopeIntegrityError:
+                    raise integrity() from None
+                entries.append({"id": record_id, "key_version": row["key_version"]})
+            return {
+                "tenant": tenant,
+                "active_version": self._active_version,
+                "records": entries,
+            }
 
     # -- keys --------------------------------------------------------------
 

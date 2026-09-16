@@ -31,11 +31,14 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | 方法与路径 | 输入 | 成功返回 |
 |---|---|---|
 | `GET /v1/keys` | 无 | `200 {"active_version":1}` |
+| `GET /v1/records` | 租户头 | `200 {"tenant":"acme","active_version":1,"records":[{"id":"invoice_1","key_version":1}]}` |
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
 
-`plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
+`GET /v1/records` 返回该租户的密钥使用清单。清单仅含当前租户数据，每项只有 `id` 和 `key_version`，按记录 id 的 ASCII 字典序升序排列；空租户返回空数组。响应不包含原文、密文、nonce、封装密钥或其他租户的任何信息。生成清单前会完整认证该租户的每个信封（正文与封装），任一信封损坏返回 `422 {"error":"integrity_error"}`，不返回部分清单；其他租户的损坏不影响本租户查询。清单与创建、轮换在同一串行边界内执行，因此响应中的 `active_version` 与全部条目对应同一个完整串行时点，不会出现半轮换的版本混合。
+
+`plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建（租户与 id 联合唯一冲突）返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。其他 SQLite 写入失败（包括 `BEFORE INSERT` 触发器以 `RAISE(ABORT,...)` 中止，它在 Python 侧同样表现为 `sqlite3.IntegrityError` 但不是唯一冲突）一律返回 `503 storage_error`，不新增或覆盖记录；故障解除后服务可继续创建和读取。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
 
@@ -61,8 +64,8 @@ AAD 是 UTF-8 编码的无多余空白 JSON 数组。正文 AAD 为 `[1,"租户"
 
 轮换只重封装数据密钥，不重新加密正文，所有记录的 `nonce` 和 `ciphertext` 字节必须保持不变。轮换需确认每条旧信封的封装和正文都可认证；任一损坏返回 `422 integrity_error`，该次请求开始前的所有记录字段及活动版本都保持不变。SQLite 写入失败返回 `503 storage_error`，同样不得出现部分提交。旧版本记录在轮换前可读，完成轮换后仍可读；重启不得重置活动版本或丢失记录。
 
-同一进程中，并发创建同租户同 id 只能一个成功，其余返回 `409 conflict`。创建、读取、轮换的成功结果必须与某个完整串行顺序一致，不能观察半轮换状态。写入与成功轮换并发结束后，所有记录均应为最终活动版本且可读；两个相同目标版本的轮换并发执行时，一个完成实际轮换，另一个返回幂等空操作。数据量范围为本地小型账本，无需分页、跨进程协调、批次后台迁移或性能基准。
+同一进程中，并发创建同租户同 id 只能一个成功，其余返回 `409 conflict`。创建、读取、清单、轮换的成功结果必须与某个完整串行顺序一致，不能观察半轮换状态。写入与成功轮换并发结束后，所有记录均应为最终活动版本且可读；两个相同目标版本的轮换并发执行时，一个完成实际轮换，另一个返回幂等空操作。数据量范围为本地小型账本，无需分页、跨进程协调、批次后台迁移或性能基准。
 
-可用离线 SQLite 维护复现损坏：先停止服务，改动一条记录的任一密文字段后重启。存储失败可用 SQLite `BEFORE UPDATE ON records` 触发器的 `RAISE(ABORT,...)` 模拟；此时观察到的 HTTP 失败不得留下其他行更新或活动版本变化。移除触发器或恢复原字段后服务应继续正常运行。这些错误路径属于本模块公开兼容要求。
+可用离线 SQLite 维护复现损坏：先停止服务，改动一条记录的任一密文字段后重启。存储失败可用 SQLite `BEFORE UPDATE ON records` 触发器的 `RAISE(ABORT,...)` 模拟轮换失败，或用 `BEFORE INSERT ON records` 触发器模拟创建失败；此时观察到的 HTTP 失败不得留下其他行更新、活动版本变化或新记录。移除触发器或恢复原字段后服务应继续正常运行。这些错误路径属于本模块公开兼容要求。
 
 密码库参考：[cryptography 49 AESGCM 文档](https://cryptography.io/en/49.0.0/hazmat/primitives/aead/#cryptography.hazmat.primitives.ciphers.aead.AESGCM)。
