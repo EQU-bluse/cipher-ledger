@@ -73,6 +73,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"status": "ok", "service": "cipher-ledger"})
             elif path == "/v1/keys":
                 self.send_json(200, {"active_version": self.server.ledger.active_version})
+            elif path == "/v1/records":
+                self.list_records()
             elif path.startswith("/v1/records/"):
                 self.get_record(path[len("/v1/records/") :])
             else:
@@ -105,6 +107,14 @@ class LedgerHandler(BaseHTTPRequestHandler):
             self.error(400, "invalid_request")
             return
         result = self.server.ledger.read(tenant, record_id)
+        self.send_json(200, result)
+
+    def list_records(self) -> None:
+        tenant = self.tenant()
+        if tenant is None:
+            self.error(400, "invalid_request")
+            return
+        result = self.server.ledger.inventory(tenant)
         self.send_json(200, result)
 
     def create_record(self) -> None:

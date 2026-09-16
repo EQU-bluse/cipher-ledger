@@ -31,9 +31,14 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | 方法与路径 | 输入 | 成功返回 |
 |---|---|---|
 | `GET /v1/keys` | 无 | `200 {"active_version":1}` |
+| `GET /v1/records` | 租户头 | `200 {"tenant":"acme","active_version":1,"records":[{"id":"invoice_1","key_version":1}]}` |
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
+
+`GET /v1/records` 返回该租户的密钥使用清单。`records` 仅包含 `id` 和该信封的 `key_version`，按记录 id 的 ASCII 字典序升序排列；空租户返回空数组。响应绝不包含原文、密文、nonce、封装密钥或其他租户的任何信息。生成清单前须完整认证该租户的每个信封（封装与正文），任一信封损坏返回 `422 integrity_error` 且不返回部分清单；其他租户的损坏信封不参与查询，不阻断本租户清单。清单与创建、轮换共用同一串行边界，因此 `active_version` 与全部条目对应某个完整串行时点，不会出现半轮换的版本混合。
+
+创建记录时，仅租户与 id 的联合唯一冲突映射为 `409 conflict`；其他 SQLite 写入失败（包括插入触发器 `RAISE(ABORT)` 中止、其他约束错误、I/O 错误）返回 `503 storage_error`，不新增或覆盖记录，故障解除后服务可继续创建和读取。
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
@@ -63,6 +68,6 @@ AAD 是 UTF-8 编码的无多余空白 JSON 数组。正文 AAD 为 `[1,"租户"
 
 同一进程中，并发创建同租户同 id 只能一个成功，其余返回 `409 conflict`。创建、读取、轮换的成功结果必须与某个完整串行顺序一致，不能观察半轮换状态。写入与成功轮换并发结束后，所有记录均应为最终活动版本且可读；两个相同目标版本的轮换并发执行时，一个完成实际轮换，另一个返回幂等空操作。数据量范围为本地小型账本，无需分页、跨进程协调、批次后台迁移或性能基准。
 
-可用离线 SQLite 维护复现损坏：先停止服务，改动一条记录的任一密文字段后重启。存储失败可用 SQLite `BEFORE UPDATE ON records` 触发器的 `RAISE(ABORT,...)` 模拟；此时观察到的 HTTP 失败不得留下其他行更新或活动版本变化。移除触发器或恢复原字段后服务应继续正常运行。这些错误路径属于本模块公开兼容要求。
+可用离线 SQLite 维护复现损坏：先停止服务，改动一条记录的任一密文字段后重启。存储失败可用 SQLite `BEFORE UPDATE ON records` 触发器的 `RAISE(ABORT,...)` 模拟轮换失败，或用 `BEFORE INSERT ON records` 触发器模拟创建失败；此时观察到的 HTTP 失败不得留下其他行更新、活动版本变化或新记录。移除触发器或恢复原字段后服务应继续正常运行。这些错误路径属于本模块公开兼容要求。
 
 密码库参考：[cryptography 49 AESGCM 文档](https://cryptography.io/en/49.0.0/hazmat/primitives/aead/#cryptography.hazmat.primitives.ciphers.aead.AESGCM)。

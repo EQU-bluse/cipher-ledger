@@ -446,5 +446,251 @@ class RecordProtocolTests(unittest.TestCase):
                 return exc.code, json.loads(exc.read())
 
 
+class InventoryTests(unittest.TestCase):
+    """GET /v1/records tenant key-usage inventory."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.directory = Path(self._dir.name)
+        self.harness = ServerHarness(make_config(self.directory))
+        self.addCleanup(self.harness.close)
+
+    def request(self, method, path, body=None, tenant=None):
+        headers = {}
+        if tenant is not None:
+            headers["X-Tenant-ID"] = tenant
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(self.harness.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = response.read()
+                return response.status, json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read())
+
+    def create(self, record_id, plaintext, tenant="acme"):
+        return self.request("POST", "/v1/records", {"id": record_id, "plaintext": plaintext}, tenant=tenant)
+
+    def inventory(self, tenant="acme"):
+        return self.request("GET", "/v1/records", tenant=tenant)
+
+    def raw_db(self):
+        return connect(self.directory / "ledger.sqlite3")
+
+    def test_empty_tenant_returns_empty_list(self):
+        self.assertEqual(
+            self.inventory("nobody"),
+            (200, {"tenant": "nobody", "active_version": 1, "records": []}),
+        )
+
+    def test_records_sorted_by_ascii_id_and_versions(self):
+        ids = ["Zebra", "apple", "_under", "Beta9", "a", "a1", "-dash", "9num", "apple"]
+        for index, record_id in enumerate(ids):
+            status, _ = self.create(record_id, "v1")
+            # "apple" appears twice; only the first create succeeds.
+            self.assertEqual(status, 201 if index == ids.index(record_id) else 409)
+        status, body = self.inventory()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tenant"], "acme")
+        self.assertEqual(body["active_version"], 1)
+        expected_ids = sorted(set(ids))  # ASCII code point order
+        self.assertEqual([r["id"] for r in body["records"]], expected_ids)
+        self.assertTrue(all(set(r) == {"id", "key_version"} for r in body["records"]))
+        self.assertTrue(all(r["key_version"] == 1 for r in body["records"]))
+        # "apple" created twice must still appear once and keep the first payload.
+        self.assertEqual(self.request("GET", "/v1/records/apple", tenant="acme")[1]["plaintext"], "v1")
+
+    def test_inventory_reflects_rotated_and_fresh_versions(self):
+        self.create("old1", "a")
+        self.create("old2", "b")
+        self.assertEqual(self.request("POST", "/v1/keys/rotate", {"version": 2}),
+                         (200, {"active_version": 2, "rewrapped": 2}))
+        self.create("new1", "c")
+        status, body = self.inventory()
+        self.assertEqual(status, 200)
+        self.assertEqual(body["active_version"], 2)
+        self.assertEqual(
+            body["records"],
+            [{"id": "new1", "key_version": 2}, {"id": "old1", "key_version": 2}, {"id": "old2", "key_version": 2}],
+        )
+
+    def test_inventory_is_tenant_scoped(self):
+        self.create("a1", "alpha", tenant="alpha")
+        self.create("b1", "beta", tenant="beta")
+        self.create("a2", "alpha2", tenant="alpha")
+        self.assertEqual(self.inventory("alpha"),
+                         (200, {"tenant": "alpha", "active_version": 1,
+                                "records": [{"id": "a1", "key_version": 1}, {"id": "a2", "key_version": 1}]}))
+        self.assertEqual(self.inventory("beta"),
+                         (200, {"tenant": "beta", "active_version": 1,
+                                "records": [{"id": "b1", "key_version": 1}]}))
+
+    def test_inventory_never_leaks_secret_fields(self):
+        secret = "机密载荷-topsecret-9c4f"
+        self.create("doc", secret)
+        status, body = self.inventory()
+        self.assertEqual(status, 200)
+        flat = json.dumps(body, ensure_ascii=False)
+        for forbidden in ("plaintext", "ciphertext", "nonce", "wrapped", secret):
+            self.assertNotIn(forbidden, flat)
+        self.assertEqual(set(body), {"tenant", "active_version", "records"})
+
+    def test_inventory_requires_valid_tenant(self):
+        self.create("doc", "x")
+        for tenant in (None, "", "bad tenant!", "$", "x" * 65):
+            with self.subTest(tenant=tenant):
+                self.assertEqual(self.inventory(tenant), (400, {"error": "invalid_request"}))
+
+    def test_damaged_envelope_aborts_inventory_without_partial_list(self):
+        self.create("good", "fine")
+        self.create("bad", "also fine")
+        raw = self.raw_db()
+        blob = bytearray(raw.execute("SELECT ciphertext FROM records WHERE id='bad'").fetchone()[0])
+        blob[0] ^= 0xFF
+        with raw:
+            raw.execute("UPDATE records SET ciphertext=? WHERE id='bad'", (bytes(blob),))
+        raw.close()
+        # Whole-tenant inventory fails; no partial list is returned.
+        self.assertEqual(self.inventory(), (422, {"error": "integrity_error"}))
+        # The healthy record is untouched and the service keeps working.
+        self.assertEqual(self.request("GET", "/v1/records/good", tenant="acme")[0], 200)
+
+    def test_other_tenant_corruption_does_not_block_inventory(self):
+        self.create("a1", "alpha-ok", tenant="alpha")
+        self.create("b1", "beta-ok", tenant="beta")
+        self.create("b2", "beta-damaged", tenant="beta")
+        raw = self.raw_db()
+        blob = bytearray(raw.execute(
+            "SELECT wrapped_key FROM records WHERE tenant='beta' AND id='b2'").fetchone()[0])
+        blob[0] ^= 0x01
+        with raw:
+            raw.execute("UPDATE records SET wrapped_key=? WHERE tenant='beta' AND id='b2'", (bytes(blob),))
+        raw.close()
+        self.assertEqual(self.inventory("alpha"),
+                         (200, {"tenant": "alpha", "active_version": 1,
+                                "records": [{"id": "a1", "key_version": 1}]}))
+        self.assertEqual(self.inventory("beta"), (422, {"error": "integrity_error"}))
+
+    def test_inventory_concurrent_with_rotation_is_always_consistent(self):
+        for i in range(6):
+            self.create(f"old{i}", f"old {i}")
+        barrier = threading.Barrier(12)
+        failures = []
+
+        def list_tenant():
+            barrier.wait()
+            status, body = self.inventory()
+            if status != 200:
+                failures.append(("list-status", status, body))
+                return
+            if body["active_version"] not in (1, 2):
+                failures.append(("active", body["active_version"]))
+            versions = {r["key_version"] for r in body["records"]}
+            if versions != {body["active_version"]}:
+                failures.append(("mixed-versions", body["active_version"], versions))
+            ids = [r["id"] for r in body["records"]]
+            if ids != sorted(ids):
+                failures.append(("order", ids))
+
+        def make_new(index):
+            barrier.wait()
+            status, _ = self.create(f"new{index}", f"new {index}")
+            if status not in (201, 409):
+                failures.append(("create", status))
+
+        def rotate():
+            barrier.wait()
+            status, body = self.request("POST", "/v1/keys/rotate", {"version": 2})
+            if status != 200:
+                failures.append(("rotate", status, body))
+
+        threads = [threading.Thread(target=list_tenant) for _ in range(5)]
+        threads += [threading.Thread(target=make_new, args=(i,)) for i in range(6)]
+        threads.append(threading.Thread(target=rotate))
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(failures, [])
+        # Final state: every record at the final active version and still readable.
+        status, body = self.inventory()
+        self.assertEqual((status, body["active_version"]), (200, 2))
+        self.assertEqual({r["key_version"] for r in body["records"]}, {2})
+        raw = self.raw_db()
+        self.assertEqual(raw.execute("SELECT COUNT(*) FROM records").fetchone()[0], 12)
+        raw.close()
+        for i in range(6):
+            self.assertEqual(self.request("GET", f"/v1/records/old{i}", tenant="acme")[0], 200)
+            self.assertEqual(self.request("GET", f"/v1/records/new{i}", tenant="acme")[0], 200)
+
+
+class CreateStorageFailureTests(unittest.TestCase):
+    """POST /v1/records write failure mapping: only unique collisions are 409."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.directory = Path(self._dir.name)
+        self.harness = ServerHarness(make_config(self.directory))
+        self.addCleanup(self.harness.close)
+
+    def request(self, method, path, body=None, tenant="acme"):
+        headers = {"Content-Type": "application/json"}
+        if tenant is not None:
+            headers["X-Tenant-ID"] = tenant
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(self.harness.base + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request) as response:
+                payload = response.read()
+                return response.status, json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read())
+
+    def create(self, record_id, plaintext="x"):
+        return self.request("POST", "/v1/records", {"id": record_id, "plaintext": plaintext})
+
+    def raw_db(self):
+        return connect(self.directory / "ledger.sqlite3")
+
+    def test_insert_trigger_abort_is_503_not_409_and_service_recovers(self):
+        self.assertEqual(self.create("existing", "first"), (201, {"id": "existing", "key_version": 1}))
+        raw = self.raw_db()
+        with raw:
+            raw.execute("CREATE TRIGGER block_records_insert BEFORE INSERT ON records "
+                        "BEGIN SELECT RAISE(ABORT, 'inserts disabled'); END")
+        raw.close()
+
+        # A fresh id hits the trigger: storage failure, not a conflict...
+        self.assertEqual(self.create("new_one"), (503, {"error": "storage_error"}))
+        # ...and so does a genuinely duplicate id while the trigger is armed
+        # (the trigger aborts before uniqueness is checked); never 409.
+        self.assertEqual(self.create("existing", "second"), (503, {"error": "storage_error"}))
+
+        raw = self.raw_db()
+        self.assertEqual(raw.execute("SELECT COUNT(*) FROM records").fetchone()[0], 1)
+        rows = {r[0]: r[1] for r in raw.execute("SELECT id, key_version FROM records")}
+        raw.close()
+        self.assertEqual(rows, {"existing": 1})
+
+        # Reads still work while writes are blocked.
+        self.assertEqual(self.request("GET", "/v1/records/existing")[1]["plaintext"], "first")
+
+        # After the fault clears, creates (and true conflicts) behave normally.
+        raw = self.raw_db()
+        with raw:
+            raw.execute("DROP TRIGGER block_records_insert")
+        raw.close()
+        self.assertEqual(self.create("new_one", "fresh"), (201, {"id": "new_one", "key_version": 1}))
+        self.assertEqual(self.create("existing", "again"), (409, {"error": "conflict"}))
+        self.assertEqual(self.request("GET", "/v1/records/existing")[1]["plaintext"], "first")
+        self.assertEqual(self.request("GET", "/v1/records/new_one")[1]["plaintext"], "fresh")
+
+
 if __name__ == "__main__":
     unittest.main()

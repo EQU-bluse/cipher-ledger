@@ -63,17 +63,11 @@ def seal(
     }
 
 
-def open_envelope(
-    keys: dict[int, bytes],
-    tenant: str,
-    record_id: str,
-    row: dict | object,
-) -> str:
-    """Authenticate and decrypt a stored envelope row.
+def _unwrap_data_key(keys, tenant, record_id, row):
+    """Authenticate the wrapping and return the enclosed data key + body fields.
 
-    Any mismatch between the AAD bindings (tenant, id, key version) or any
-    tampering with the nonce, ciphertext or wrapped key raises
-    EnvelopeIntegrityError. No partial plaintext is returned.
+    Raises EnvelopeIntegrityError if the stored row is malformed, its key
+    version is unavailable, or the wrapping cannot be authenticated.
     """
     try:
         version = row["key_version"]
@@ -90,12 +84,51 @@ def open_envelope(
         data_key = AESGCM(kek).decrypt(
             wrap_nonce, wrapped_key, wrap_aad(tenant, record_id, version)
         )
+    except (InvalidTag, ValueError):
+        raise EnvelopeIntegrityError("envelope authentication failed") from None
+    return data_key, body_nonce, body, version
+
+
+def open_envelope(
+    keys: dict[int, bytes],
+    tenant: str,
+    record_id: str,
+    row: dict | object,
+) -> str:
+    """Authenticate and decrypt a stored envelope row.
+
+    Any mismatch between the AAD bindings (tenant, id, key version) or any
+    tampering with the nonce, ciphertext or wrapped key raises
+    EnvelopeIntegrityError. No partial plaintext is returned.
+    """
+    data_key, body_nonce, body, _ = _unwrap_data_key(keys, tenant, record_id, row)
+    try:
         plaintext = AESGCM(data_key).decrypt(
             body_nonce, body, body_aad(tenant, record_id)
         )
         return plaintext.decode("utf-8")
     except (InvalidTag, UnicodeDecodeError, ValueError):
         raise EnvelopeIntegrityError("envelope authentication failed") from None
+
+
+def verify(
+    keys: dict[int, bytes],
+    tenant: str,
+    record_id: str,
+    row: dict | object,
+) -> int:
+    """Authenticate every part of an envelope without returning plaintext.
+
+    Both the data-key wrapping and the body are verified. Used by operations
+    that need proof of integrity without exposing content (the tenant key
+    usage inventory). Returns the envelope's key version.
+    """
+    data_key, body_nonce, body, version = _unwrap_data_key(keys, tenant, record_id, row)
+    try:
+        AESGCM(data_key).decrypt(body_nonce, body, body_aad(tenant, record_id))
+    except (InvalidTag, ValueError):
+        raise EnvelopeIntegrityError("envelope authentication failed") from None
+    return version
 
 
 def rewrap(
@@ -111,21 +144,8 @@ def rewrap(
     returned. The body nonce and ciphertext are never touched; only the data
     key is re-wrapped with a fresh wrap nonce.
     """
+    data_key, body_nonce, body, _ = _unwrap_data_key(keys, tenant, record_id, row)
     try:
-        old_version = row["key_version"]
-        body_nonce = row["nonce"]
-        body = row["ciphertext"]
-        wrap_nonce = row["wrap_nonce"]
-        wrapped_key = row["wrapped_key"]
-    except (KeyError, IndexError, TypeError):
-        raise EnvelopeIntegrityError("malformed envelope") from None
-    old_kek = keys.get(old_version) if type(old_version) is int else None
-    if old_kek is None:
-        raise EnvelopeIntegrityError("wrap version unavailable")
-    try:
-        data_key = AESGCM(old_kek).decrypt(
-            wrap_nonce, wrapped_key, wrap_aad(tenant, record_id, old_version)
-        )
         # Authenticate the body too: a damaged body must fail the whole rotation.
         AESGCM(data_key).decrypt(body_nonce, body, body_aad(tenant, record_id))
         new_wrap_nonce = os.urandom(NONCE_SIZE)
@@ -133,5 +153,5 @@ def rewrap(
             new_wrap_nonce, data_key, wrap_aad(tenant, record_id, new_version)
         )
         return new_wrap_nonce, new_wrapped
-    except (InvalidTag, ValueError):
+    except (InvalidTag, ValueError, KeyError):
         raise EnvelopeIntegrityError("envelope authentication failed") from None

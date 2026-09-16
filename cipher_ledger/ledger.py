@@ -14,6 +14,18 @@ from . import envelope
 from .config import Config
 from .database import connect, initialize
 
+# Extended SQLite result codes that specifically mean a row with the same
+# PRIMARY KEY / UNIQUE value already exists. Only these map to 409 conflict;
+# every other write failure (trigger RAISE(ABORT), NOT NULL, CHECK, I/O, ...)
+# maps to 503 storage_error. sqlite3 exposes extended codes by default.
+_UNIQUE_VIOLATION_CODES = frozenset(
+    getattr(sqlite3, name, fallback)
+    for name, fallback in (
+        ("SQLITE_CONSTRAINT_PRIMARYKEY", 1555),
+        ("SQLITE_CONSTRAINT_UNIQUE", 2067),
+    )
+)
+
 
 class LedgerError(Exception):
     """Application-level error mapped to an HTTP status and code."""
@@ -89,9 +101,14 @@ class Ledger:
                             sealed["wrapped_key"],
                         ),
                     )
-            except sqlite3.IntegrityError:
-                # PRIMARY KEY (tenant, id) violation -> record already exists.
-                raise conflict() from None
+            except sqlite3.IntegrityError as exc:
+                # Only the (tenant, id) PRIMARY KEY / UNIQUE collision is a
+                # conflict. Trigger RAISE(ABORT) and other constraints arrive
+                # here too but with different extended codes: those are storage
+                # failures and must never be reported as 409.
+                if exc.sqlite_errorcode in _UNIQUE_VIOLATION_CODES:
+                    raise conflict() from None
+                raise storage() from None
             except sqlite3.Error:
                 raise storage() from None
             return version
@@ -113,6 +130,41 @@ class Ledger:
             except envelope.EnvelopeIntegrityError:
                 raise integrity() from None
             return {"id": record_id, "plaintext": plaintext, "key_version": row["key_version"]}
+
+    def inventory(self, tenant: str) -> dict:
+        """List this tenant's record ids with their key versions.
+
+        Every envelope of the tenant is fully authenticated (wrapping and
+        body) before the list is returned; a single damaged envelope aborts
+        the whole request with 422 and no partial list. Other tenants are
+        never read, so their damaged envelopes cannot block this query. The
+        operation holds the same lock as create/rotate, so the active version
+        and every entry come from one complete serial point in time.
+        """
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    "SELECT id, key_version, nonce, ciphertext, wrap_nonce, wrapped_key "
+                    "FROM records WHERE tenant=? ORDER BY id ASC",
+                    (tenant,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            records = []
+            for row in rows:
+                record_id = row["id"]
+                try:
+                    version = envelope.verify(
+                        self._keys, tenant, record_id, row
+                    )
+                except envelope.EnvelopeIntegrityError:
+                    raise integrity() from None
+                records.append({"id": record_id, "key_version": version})
+            return {
+                "tenant": tenant,
+                "active_version": self._active_version,
+                "records": records,
+            }
 
     # -- keys --------------------------------------------------------------
 
