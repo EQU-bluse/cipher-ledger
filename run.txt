@@ -1,0 +1,11 @@
+Install
+python -m pip install -r requirements.txt
+python tools/create_keyring.py --output keyring.json
+
+Start
+python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --keyring keyring.json
+
+Smoke Test
+python -m unittest discover -s tests -v
+python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8087/health').read().decode())"
+Expected health response: {"status":"ok","service":"cipher-ledger"}
