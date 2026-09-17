@@ -35,12 +35,26 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
+| `GET /v1/audit` | 租户头 | `200 {"tenant":"acme","events":[[1,"create","invoice_1",1,"0…0","<digest>"]]}` |
 
 `GET /v1/records` 返回该租户的密钥使用清单。清单仅含当前租户数据，每项只有 `id` 和 `key_version`，按记录 id 的 ASCII 字典序升序排列；空租户返回空数组。响应不包含原文、密文、nonce、封装密钥或其他租户的任何信息。生成清单前会完整认证该租户的每个信封（正文与封装），任一信封损坏返回 `422 {"error":"integrity_error"}`，不返回部分清单；其他租户的损坏不影响本租户查询。清单与创建、轮换在同一串行边界内执行，因此响应中的 `active_version` 与全部条目对应同一个完整串行时点，不会出现半轮换的版本混合。
 
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建（租户与 id 联合唯一冲突）返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。其他 SQLite 写入失败（包括 `BEFORE INSERT` 触发器以 `RAISE(ABORT,...)` 中止，它在 Python 侧同样表现为 `sqlite3.IntegrityError` 但不是唯一冲突）一律返回 `503 storage_error`，不新增或覆盖记录；故障解除后服务可继续创建和读取。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
+
+## 租户审计链
+
+`GET /v1/audit` 要求合法的 `X-Tenant-ID`，缺少或非法返回 `400 invalid_request`。成功返回 `{"tenant":"…","events":[…]}`，只包含本租户事件；从未有过记录的租户返回空数组。每个租户拥有独立的哈希链，序列 `sequence` 从 1 开始连续编号，按升序返回。事件为定长 JSON 数组：
+
+- 创建：`[sequence,"create",id,key_version,previous,digest]`
+- 轮换：`[sequence,"rotate",from_version,to_version,rewrapped,previous,digest]`
+
+`previous` 是前一条事件的 `digest`；租户的第一条事件 `previous` 为 64 个字符 `0`。`digest` 的计算方式为：取该事件去掉末尾 `digest` 后的数组，把 `1,tenant`（格式版本与租户标识）置于数组开头，序列化得到无多余空白的 UTF-8 JSON，再对其 UTF-8 字节取 SHA-256，输出小写十六进制。例如创建事件摘要输入形如 `[1,"acme",1,"create","invoice_1",1,"000…0"]`。因此链上任一字段被改动、错序或错链，都可由维护者离线重算发现；事件本身不含原文、密文、nonce 或密钥材料。
+
+成功创建记录时，create 事件与记录插入在同一 SQLite 事务内原子追加；重复创建（`409 conflict`）不追加。实际发生轮换时，在同一事务内为每个有记录的租户各原子追加一条 rotate 事件，其 `rewrapped` 为该租户受影响的记录数，`from_version` 为轮换前的活动版本。版本回退（`409 version_conflict`）、幂等同版本轮换、目标版本不在 keyring（`400 invalid_version`）、信封损坏（`422 integrity_error`）以及存储失败（`503 storage_error`）均不追加任何事件。空库轮换不产生事件。
+
+审计事件写入与业务写入共同提交、共同回滚：审计表的写入失败同样返回 `503 storage_error`，该次请求的记录插入或信封重封装一并撤销，故障解除后链从断点继续可用。审计读取与创建、轮换共享同一进程级串行边界，因此不会出现重号、断号或错链；事件持久化在 SQLite，重启后保留。
 
 ## 信封存储与兼容格式
 

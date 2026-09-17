@@ -10,6 +10,7 @@ the active version and all records exactly as they were before the request.
 import sqlite3
 import threading
 
+from . import audit as auditmod
 from . import envelope
 from .config import Config
 from .database import connect, initialize
@@ -107,6 +108,7 @@ class Ledger:
                             sealed["wrapped_key"],
                         ),
                     )
+                    self._append_create_event(tenant, record_id, version)
             except sqlite3.Error as exc:
                 # A trigger RAISE(ABORT) is also an IntegrityError, so the
                 # exception type alone cannot distinguish a duplicate id. Only a
@@ -167,6 +169,66 @@ class Ledger:
                 "records": entries,
             }
 
+    # -- audit -------------------------------------------------------------
+
+    def _chain_tip(self, tenant: str) -> tuple[int, str]:
+        """Return (last sequence, last digest) for a tenant's audit chain."""
+        row = self._connection.execute(
+            "SELECT sequence, digest FROM audit_events "
+            "WHERE tenant=? ORDER BY sequence DESC LIMIT 1",
+            (tenant,),
+        ).fetchone()
+        if row is None:
+            return 0, auditmod.GENESIS_PREVIOUS
+        return row["sequence"], row["digest"]
+
+    def _append_create_event(self, tenant: str, record_id: str, version: int) -> None:
+        sequence, previous = self._chain_tip(tenant)
+        sequence += 1
+        digest = auditmod.create_digest(tenant, sequence, record_id, version, previous)
+        self._connection.execute(
+            "INSERT INTO audit_events "
+            "(tenant, sequence, kind, record_id, key_version, previous, digest) "
+            "VALUES (?, ?, 'create', ?, ?, ?, ?)",
+            (tenant, sequence, record_id, version, previous, digest),
+        )
+
+    def audit(self, tenant: str) -> dict:
+        """Return the tenant's complete, hash-chained audit event list."""
+        with self._lock:
+            try:
+                rows = self._connection.execute(
+                    "SELECT kind, record_id, key_version, from_version, to_version, "
+                    "rewrapped, previous, digest, sequence FROM audit_events "
+                    "WHERE tenant=? ORDER BY sequence ASC",
+                    (tenant,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+            events = []
+            for row in rows:
+                if row["kind"] == "create":
+                    event = [
+                        row["sequence"],
+                        "create",
+                        row["record_id"],
+                        row["key_version"],
+                        row["previous"],
+                        row["digest"],
+                    ]
+                else:
+                    event = [
+                        row["sequence"],
+                        "rotate",
+                        row["from_version"],
+                        row["to_version"],
+                        row["rewrapped"],
+                        row["previous"],
+                        row["digest"],
+                    ]
+                events.append(event)
+            return {"tenant": tenant, "events": events}
+
     # -- keys --------------------------------------------------------------
 
     def rotate(self, target: int) -> tuple[int, int]:
@@ -190,6 +252,7 @@ class Ledger:
             # Verify and rewrap every envelope before any write. A single bad
             # envelope aborts the whole request with nothing changed.
             rewrapped: list[tuple] = []
+            counts: dict[str, int] = {}
             for row in rows:
                 try:
                     new_wrap_nonce, new_wrapped = envelope.rewrap(
@@ -198,6 +261,7 @@ class Ledger:
                 except envelope.EnvelopeIntegrityError:
                     raise integrity() from None
                 rewrapped.append((new_wrap_nonce, new_wrapped, target, row["tenant"], row["id"]))
+                counts[row["tenant"]] = counts.get(row["tenant"], 0) + 1
 
             try:
                 with self._connection:
@@ -211,6 +275,29 @@ class Ledger:
                         "UPDATE service_metadata SET value=? WHERE name='active_version'",
                         (str(target),),
                     )
+                    # One rotate event per tenant that actually holds records;
+                    # rewrapped is that tenant's affected count. Tenants without
+                    # records get no event.
+                    for tenant in sorted(counts):
+                        sequence, previous = self._chain_tip(tenant)
+                        sequence += 1
+                        digest = auditmod.rotate_digest(
+                            tenant, sequence, self._active_version, target, counts[tenant], previous
+                        )
+                        self._connection.execute(
+                            "INSERT INTO audit_events "
+                            "(tenant, sequence, kind, from_version, to_version, rewrapped, "
+                            "previous, digest) VALUES (?, ?, 'rotate', ?, ?, ?, ?, ?)",
+                            (
+                                tenant,
+                                sequence,
+                                self._active_version,
+                                target,
+                                counts[tenant],
+                                previous,
+                                digest,
+                            ),
+                        )
             except sqlite3.Error:
                 raise storage() from None
 

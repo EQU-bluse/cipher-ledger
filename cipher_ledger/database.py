@@ -44,6 +44,20 @@ def initialize(database: str | Path, initial_version: int | None = None) -> None
                 "wrapped_key BLOB NOT NULL, "
                 "PRIMARY KEY (tenant, id))"
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS audit_events ("
+                "tenant TEXT NOT NULL, "
+                "sequence INTEGER NOT NULL, "
+                "kind TEXT NOT NULL, "
+                "record_id TEXT, "
+                "key_version INTEGER, "
+                "from_version INTEGER, "
+                "to_version INTEGER, "
+                "rewrapped INTEGER, "
+                "previous TEXT NOT NULL, "
+                "digest TEXT NOT NULL, "
+                "PRIMARY KEY (tenant, sequence))"
+            )
             if initial_version is not None:
                 connection.execute(
                     "INSERT OR IGNORE INTO service_metadata(name, value) VALUES (?, ?)",
