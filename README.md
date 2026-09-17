@@ -32,6 +32,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 |---|---|---|
 | `GET /v1/keys` | 无 | `200 {"active_version":1}` |
 | `GET /v1/records` | 租户头 | `200 {"tenant":"acme","active_version":1,"records":[{"id":"invoice_1","key_version":1}]}` |
+| `GET /v1/audit` | 租户头 | `200 {"tenant":"acme","events":[[1,"create","invoice_1",1,"000…0","<digest>"]]}` |
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
 | `GET /v1/records/invoice_1` | 租户头 | `200 {"id":"invoice_1","plaintext":"待保存文字","key_version":1}` |
 | `POST /v1/keys/rotate` | `{"version":2}` | `200 {"active_version":2,"rewrapped":记录总数}` |
@@ -41,6 +42,19 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建（租户与 id 联合唯一冲突）返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。其他 SQLite 写入失败（包括 `BEFORE INSERT` 触发器以 `RAISE(ABORT,...)` 中止，它在 Python 侧同样表现为 `sqlite3.IntegrityError` 但不是唯一冲突）一律返回 `503 storage_error`，不新增或覆盖记录；故障解除后服务可继续创建和读取。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
+
+## 租户审计链
+
+`GET /v1/audit` 与记录接口一样要求合法 `X-Tenant-ID`，缺少或非法返回 `400 invalid_request`。成功返回 `{"tenant":"…","events":[…]}`，事件按序号升序，仅包含本租户；从无记录的租户返回空数组。每次成功创建与记录原子追加一条 `create` 事件；实际轮换在同一事务内为每个拥有记录的租户原子追加一条 `rotate` 事件，其 `rewrapped` 为该租户受影响记录数。重复创建（409）、幂等同版本轮换、版本回滚请求以及任何失败的创建/轮换都不追加事件。
+
+每租户事件序号从 1 开始连续编号、独立计数，事件为定长 JSON 数组，字段依次为：
+
+- 创建：`[sequence,"create",id,key_version,previous,digest]`
+- 轮换：`[sequence,"rotate",from_version,to_version,rewrapped,previous,digest]`
+
+`previous` 链接同一租户上一事件的 `digest`；该租户首条事件的 `previous` 为 64 个 `0`。`digest` 是对「去掉 digest 后、再把 `1,tenant` 置于数组开头」的数组做无空白 UTF-8 JSON 序列化（`separators=(",",":")`，`ensure_ascii=false`）后取 SHA-256 的小写十六进制，即创建事件的摘要输入为 `[1,"租户",sequence,"create",id,key_version,previous]`，轮换事件为 `[1,"租户",sequence,"rotate",from_version,to_version,rewrapped,previous]`。数字 1 为审计格式版本。据此任何持有响应者都可离线校验序号连续、前后链接与全部摘要。
+
+审计事件存于 SQLite `audit_events` 表（`tenant,sequence` 联合主键，附 `kind` 及各事件字段），跨重启持久。审计读取与创建、轮换、清单共享同一进程级串行锁，链上不会出现重号、断号或错链。审计表写入失败与业务写入一样表现为 `503 storage_error`，业务记录与审计事件在同一事务内共同回滚；故障解除后服务恢复正常，链仍可完整校验。
 
 ## 信封存储与兼容格式
 
