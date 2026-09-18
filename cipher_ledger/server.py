@@ -92,6 +92,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/records":
                 self.create_record()
+            elif path == "/v1/keys/reload":
+                self.reload_keys()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -160,6 +162,12 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         active, rewrapped = self.server.ledger.rotate(version)
         self.send_json(200, {"active_version": active, "rewrapped": rewrapped})
+
+    def reload_keys(self) -> None:
+        # Trusted local management endpoint, no request body and no tenant
+        # header. The body is intentionally neither read nor required.
+        active, versions = self.server.ledger.reload_keyring()
+        self.send_json(200, {"active_version": active, "versions": versions})
 
     def log_message(self, format: str, *args) -> None:
         # Access logs contain only the usual request line and status information;

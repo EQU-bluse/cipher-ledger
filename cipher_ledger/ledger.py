@@ -1,17 +1,23 @@
 """Tenant-scoped record storage with envelope encryption and key rotation.
 
 All operations take one process-wide re-entrant lock so the results of
-concurrent creates, reads and rotations are equivalent to some total serial
-ordering. Rotation verifies every old envelope first and only then performs a
-single transactional write, so a damaged envelope or a storage failure leaves
-the active version and all records exactly as they were before the request.
+concurrent creates, reads, rotations, inventory/audit reads and keyring
+reloads are equivalent to some total serial ordering. Rotation verifies every
+old envelope first and only then performs a single transactional write, so a
+damaged envelope or a storage failure leaves the active version and all
+records exactly as they were before the request. A keyring reload validates
+the new file and authenticates every existing envelope against the candidate
+keys before swapping the in-memory snapshot in one assignment; any failure
+leaves the running snapshot, active version, records and audit chain untouched.
 """
 
+import binascii
+import json
 import sqlite3
 import threading
 
 from . import audit, envelope
-from .config import Config
+from .config import Config, parse_keyring
 from .database import connect, initialize
 
 
@@ -40,6 +46,10 @@ def storage() -> LedgerError:
     return LedgerError(503, "storage_error")
 
 
+def invalid_keyring() -> LedgerError:
+    return LedgerError(400, "invalid_keyring")
+
+
 # Only the composite (tenant, id) primary-key collision is a client conflict.
 # Every other write failure -- including a BEFORE INSERT trigger aborting with
 # RAISE(ABORT), which also surfaces as sqlite3.IntegrityError but carries the
@@ -62,6 +72,7 @@ class Ledger:
     def __init__(self, config: Config):
         initialize(config.database, config.active_version)
         self._keys = dict(config.keys)
+        self._keyring_path = config.keyring_path
         self._connection = connect(config.database)
         self._lock = threading.RLock()
         try:
@@ -302,3 +313,58 @@ class Ledger:
 
             self._active_version = target
             return target, len(rewrapped)
+
+    # -- online keyring reload --------------------------------------------
+
+    def reload_keyring(self) -> tuple[int, list[int]]:
+        """Atomically reload the keyring file from ``--keyring``.
+
+        Re-reads the UTF-8 JSON file and applies the same version, Base64 and
+        32-byte key validation as startup, then requires the persisted active
+        version and every version referenced by an existing record to be
+        present, and authenticates every existing envelope (wrap and body)
+        against the candidate keys. Only when all of that succeeds is the
+        in-memory snapshot replaced in one assignment; the persisted active
+        version, records and audit chain are never modified. The file's own
+        ``active_version`` is validated for format and key presence but never
+        overrides the database state.
+
+        Returns ``(persisted_active_version, sorted_loaded_versions)``. Any
+        failure raises invalid_keyring (400); storage errors stay 503.
+        """
+        with self._lock:
+            if self._keyring_path is None:
+                raise invalid_keyring()
+            try:
+                raw = json.loads(self._keyring_path.read_text(encoding="utf-8"))
+                _file_active, candidate_keys = parse_keyring(raw)
+            except (OSError, ValueError, TypeError, KeyError, binascii.Error):
+                raise invalid_keyring() from None
+
+            # The currently active version and every version a record still
+            # references must be available in the candidate snapshot.
+            if self._active_version not in candidate_keys:
+                raise invalid_keyring()
+
+            try:
+                rows = self._connection.execute(
+                    "SELECT tenant, id, key_version, nonce, ciphertext, "
+                    "wrap_nonce, wrapped_key FROM records"
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            for row in rows:
+                if row["key_version"] not in candidate_keys:
+                    raise invalid_keyring()
+                try:
+                    envelope.open_envelope(
+                        candidate_keys, row["tenant"], row["id"], row
+                    )
+                except envelope.EnvelopeIntegrityError:
+                    raise invalid_keyring() from None
+
+            # One-shot replacement: concurrent operations under this same lock
+            # can only ever see the old snapshot or the complete new one.
+            self._keys = candidate_keys
+            return self._active_version, sorted(candidate_keys)

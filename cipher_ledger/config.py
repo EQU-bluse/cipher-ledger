@@ -12,30 +12,51 @@ class Config:
     database: Path
     active_version: int
     keys: dict[int, bytes]
+    # Path re-read on every POST /v1/keys/reload. None only in tests that
+    # build a Config directly without a backing keyring file.
+    keyring_path: Path | None = None
+
+
+def parse_keyring(raw: object) -> tuple[int, dict[int, bytes]]:
+    """Validate a decoded keyring document.
+
+    Returns ``(active_version, keys)``. The version is checked for format and
+    key presence only here; whether it matches the persisted database state is
+    decided by the caller (startup requires it, reload must never let it
+    override the database).
+    """
+    active = raw["active_version"]
+    if type(active) is not int or active < 1:
+        raise ValueError("invalid active version")
+    encoded_keys = raw["keys"]
+    if not isinstance(encoded_keys, dict) or not encoded_keys:
+        raise ValueError("empty key set")
+    keys = {}
+    for name, encoded in encoded_keys.items():
+        if not isinstance(name, str) or not name.isascii() or not name.isdecimal():
+            raise ValueError("invalid version")
+        version = int(name)
+        if version < 1 or str(version) != name or not isinstance(encoded, str):
+            raise ValueError("invalid key entry")
+        material = base64.b64decode(encoded, validate=True)
+        if len(material) != 32:
+            raise ValueError("invalid key length")
+        keys[version] = material
+    if active not in keys:
+        raise ValueError("active version unavailable")
+    return active, keys
+
+
+def read_keyring(keyring: str | Path) -> tuple[int, dict[int, bytes]]:
+    """Read and validate a UTF-8 JSON keyring file."""
+    try:
+        raw = json.loads(Path(keyring).read_text(encoding="utf-8"))
+        return parse_keyring(raw)
+    except (OSError, ValueError, TypeError, KeyError, binascii.Error) as exc:
+        raise ValueError("Invalid keyring configuration") from exc
 
 
 def load_config(database: str | Path, keyring: str | Path) -> Config:
-    try:
-        raw = json.loads(Path(keyring).read_text(encoding="utf-8"))
-        active = raw["active_version"]
-        if type(active) is not int or active < 1:
-            raise ValueError("invalid active version")
-        encoded_keys = raw["keys"]
-        if not isinstance(encoded_keys, dict) or not encoded_keys:
-            raise ValueError("empty key set")
-        keys = {}
-        for name, encoded in encoded_keys.items():
-            if not isinstance(name, str) or not name.isascii() or not name.isdecimal():
-                raise ValueError("invalid version")
-            version = int(name)
-            if version < 1 or str(version) != name or not isinstance(encoded, str):
-                raise ValueError("invalid key entry")
-            material = base64.b64decode(encoded, validate=True)
-            if len(material) != 32:
-                raise ValueError("invalid key length")
-            keys[version] = material
-        if active not in keys:
-            raise ValueError("active version unavailable")
-        return Config(Path(database).resolve(), active, keys)
-    except (OSError, ValueError, TypeError, KeyError, binascii.Error) as exc:
-        raise ValueError("Invalid keyring configuration") from exc
+    keyring_path = Path(keyring)
+    active, keys = read_keyring(keyring_path)
+    return Config(Path(database).resolve(), active, keys, keyring_path)
