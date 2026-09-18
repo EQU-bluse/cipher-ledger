@@ -18,7 +18,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 
 ## 配置和持久状态
 
-`--db` 指定 SQLite 文件，`--keyring` 指定 UTF-8 JSON 文件，形状为 `{"active_version":1,"keys":{"1":"<base64>","2":"<base64>","3":"<base64>"}}`。版本是正整数，密钥是各自独立的 32 字节随机值，编码采用标准 Base64。keyring 只在启动时加载；文件属于外部配置，禁止把其中的密钥写入数据库或日志。已有配置校验行为需保留。
+`--db` 指定 SQLite 文件，`--keyring` 指定 UTF-8 JSON 文件，形状为 `{"active_version":1,"keys":{"1":"<base64>","2":"<base64>","3":"<base64>"}}`。版本是正整数，密钥是各自独立的 32 字节随机值，编码采用标准 Base64。keyring 在启动时加载，并可通过 `POST /v1/keys/reload` 在线原子重载（见下文）；文件属于外部配置，禁止把其中的密钥写入数据库或日志。已有配置校验行为需保留。
 
 数据库首次启用记录功能时，以配置中的 `active_version` 初始化持久活动版本。之后重启以数据库状态为准，即使配置中的初始值仍为 1。活动版本存于现有 `service_metadata` 表，`name='active_version'`，`value` 为十进制字符串；保留其他元数据。加载的 keyring 必须包含数据库活动版本及读取/轮换所需的版本；维护者会保留这些密钥。完成轮换后，不再有记录引用的旧密钥可以从文件移除，重启时把配置初始值调整为仍存在的版本。
 
@@ -31,6 +31,7 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 | 方法与路径 | 输入 | 成功返回 |
 |---|---|---|
 | `GET /v1/keys` | 无 | `200 {"active_version":1}` |
+| `POST /v1/keys/reload` | 无请求正文 | `200 {"active_version":1,"versions":[1,2,3]}` |
 | `GET /v1/records` | 租户头 | `200 {"tenant":"acme","active_version":1,"records":[{"id":"invoice_1","key_version":1}]}` |
 | `GET /v1/audit` | 租户头 | `200 {"tenant":"acme","events":[[1,"create","invoice_1",1,"000…0","<digest>"]]}` |
 | `POST /v1/records` | 租户头；`{"id":"invoice_1","plaintext":"待保存文字"}` | `201 {"id":"invoice_1","key_version":1}` |
@@ -42,6 +43,14 @@ python -m cipher_ledger --host 127.0.0.1 --port 8087 --db data/ledger.sqlite3 --
 `plaintext` 必须是字符串，UTF-8 编码长度允许 0 到 65536 字节（含两端）。超限返回 `400 invalid_request`；空串、中文、emoji 和换行往返保持原样。租户内 id 唯一，重复创建（租户与 id 联合唯一冲突）返回 `409 conflict`，原记录保持不变；不同租户允许同名 id。其他 SQLite 写入失败（包括 `BEFORE INSERT` 触发器以 `RAISE(ABORT,...)` 中止，它在 Python 侧同样表现为 `sqlite3.IntegrityError` 但不是唯一冲突）一律返回 `503 storage_error`，不新增或覆盖记录；故障解除后服务可继续创建和读取。不存在的记录及另一个租户的记录均返回 `404 not_found`。读取信封的任一认证失败返回 `422 integrity_error`，不能返回部分明文，服务之后仍可处理正常请求。
 
 轮换版本必须在 keyring 中，否则 `400 invalid_version`。格式非法仍为 `400 invalid_request`。版本低于当前值返回 `409 version_conflict`；版本等于当前值为幂等空操作，返回当前版本及 `rewrapped:0`，不改任何信封。更高版本允许跳号，成功时更新全部租户的每条记录及活动版本，`rewrapped` 等于记录数，包括空库返回 0。成功后新建记录只能使用新的活动版本。
+
+## Keyring 在线重载
+
+`POST /v1/keys/reload` 是本地受信任管理接口，不需租户头、不带请求正文（任何非空正文返回 `400 invalid_request`）。每次调用重新读取启动时 `--keyring` 指定的 UTF-8 JSON 文件，沿用启动时完全相同的版本、Base64 和 32 字节密钥校验。以下任一情况返回 `400 {"error":"invalid_keyring"}`：文件不可读；JSON 结构非法（非对象、缺字段、字段类型错误、空键集）；版本或密钥编码不合法；候选快照缺少数据库当前活动版本；缺少任一现有记录引用的版本；或候选密钥不能认证任一现有信封（正文与封装都要认证）。
+
+任何失败都不改变当前内存快照、持久活动版本、记录或审计链——重载只读数据库、只在全部校验通过后做一次内存替换，修复文件后可直接重试。文件中的 `active_version` 在校验格式和键存在后即被忽略，永远不覆盖数据库状态，因此删除旧版本后可以把它指向其他仍存在的版本。成功时一次性替换快照并返回 `200 {"active_version":数据库当前持久活动版本,"versions":[已加载版本升序]}`。新增的高版本立即可用于轮换；轮换完成后，非活动且无任何记录引用的旧版本可从文件删除后重载。响应与日志均不包含密钥材料。
+
+重载与创建、读取、清单、轮换、审计读取共享同一进程级串行边界：全部校验与替换在该锁内完成，并发请求只能观察到完整的旧快照或完整的新快照，与轮换竞态不会产生半更新、内部错误或暂时不可读。重载不写入数据库、不追加审计事件，SQLite 格式与重启语义保持不变。
 
 ## 租户审计链
 

@@ -92,6 +92,8 @@ class LedgerHandler(BaseHTTPRequestHandler):
         try:
             if path == "/v1/records":
                 self.create_record()
+            elif path == "/v1/keys/reload":
+                self.reload_keys()
             elif path == "/v1/keys/rotate":
                 self.rotate_keys()
             else:
@@ -147,6 +149,19 @@ class LedgerHandler(BaseHTTPRequestHandler):
             return
         version = self.server.ledger.create(tenant, record_id, plaintext)
         self.send_json(201, {"id": record_id, "key_version": version})
+
+    def reload_keys(self) -> None:
+        # Trusted local management endpoint: no request body and no tenant.
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.error(400, "invalid_request")
+            return
+        if length < 0 or self.rfile.read(length):
+            self.error(400, "invalid_request")
+            return
+        result = self.server.ledger.reload()
+        self.send_json(200, result)
 
     def rotate_keys(self) -> None:
         payload = self.read_json_object()

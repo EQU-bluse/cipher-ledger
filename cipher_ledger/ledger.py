@@ -11,7 +11,7 @@ import sqlite3
 import threading
 
 from . import audit, envelope
-from .config import Config
+from .config import Config, load_keyring_file
 from .database import connect, initialize
 
 
@@ -40,6 +40,10 @@ def storage() -> LedgerError:
     return LedgerError(503, "storage_error")
 
 
+def invalid_keyring() -> LedgerError:
+    return LedgerError(400, "invalid_keyring")
+
+
 # Only the composite (tenant, id) primary-key collision is a client conflict.
 # Every other write failure -- including a BEFORE INSERT trigger aborting with
 # RAISE(ABORT), which also surfaces as sqlite3.IntegrityError but carries the
@@ -62,6 +66,7 @@ class Ledger:
     def __init__(self, config: Config):
         initialize(config.database, config.active_version)
         self._keys = dict(config.keys)
+        self._keyring_path = config.keyring
         self._connection = connect(config.database)
         self._lock = threading.RLock()
         try:
@@ -302,3 +307,63 @@ class Ledger:
 
             self._active_version = target
             return target, len(rewrapped)
+
+    # -- keyring management ------------------------------------------------
+
+    def reload(self) -> dict:
+        """Atomically reload the keyring file into memory.
+
+        The file is re-read and fully validated -- including cryptographically
+        authenticating every existing envelope against the candidate keys --
+        before the in-memory snapshot is touched. An unreadable file, an
+        invalid structure, a missing active or referenced version, or any
+        envelope the candidate keys cannot authenticate fails with
+        ``invalid_keyring`` and leaves the current snapshot, active version,
+        records and audit chain exactly as they were; a fixed file can simply
+        be retried. The file's ``active_version`` is format-checked only and
+        never overrides the database state.
+
+        Runs under the same process-wide lock as create/read/inventory/
+        rotate/audit, so concurrent callers observe either the complete old
+        snapshot or the complete new one.
+        """
+        with self._lock:
+            if self._keyring_path is None:
+                raise invalid_keyring()
+            try:
+                _, candidate = load_keyring_file(self._keyring_path)
+            except ValueError:
+                raise invalid_keyring() from None
+
+            # The database's persisted active version must remain usable.
+            if self._active_version not in candidate:
+                raise invalid_keyring()
+
+            try:
+                rows = self._connection.execute(
+                    "SELECT tenant, id, key_version, nonce, ciphertext, "
+                    "wrap_nonce, wrapped_key FROM records"
+                ).fetchall()
+            except sqlite3.Error:
+                raise storage() from None
+
+            # Every version referenced by an existing record must be present,
+            # and every envelope (body and wrapping) must authenticate against
+            # the candidate snapshot. Verify everything first; the swap is the
+            # only mutation and is a single assignment.
+            for row in rows:
+                version = row["key_version"]
+                if type(version) is not int or version not in candidate:
+                    raise invalid_keyring()
+                try:
+                    envelope.open_envelope(
+                        candidate, row["tenant"], row["id"], row
+                    )
+                except envelope.EnvelopeIntegrityError:
+                    raise invalid_keyring() from None
+
+            self._keys = candidate
+            return {
+                "active_version": self._active_version,
+                "versions": sorted(candidate),
+            }
